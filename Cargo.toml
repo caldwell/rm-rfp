@@ -8,3 +8,5 @@ name = "rmp"
 path = "rmp.rs"
 
 [dependencies]
+anyhow = "1"
+indicatif = "0.17"
