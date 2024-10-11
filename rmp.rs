@@ -10,12 +10,32 @@ use std::{fs::{read_dir, remove_dir, remove_file},
           time::Duration};
 
 use anyhow::{anyhow, Error, Result};
+use docopt::Docopt;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
+use serde::Deserialize;
 
 static TOTAL: OnceLock<RwLock<Stats>> = OnceLock::new();
 
+fn usage() -> String {
+    format!(r#"
+Usage:
+  rmp --help
+  rmp <path>...
+
+Options:
+  -h, --help               Show this screen.
+"#)
+}
+
+#[derive(Debug, Deserialize)]
+struct Args {
+    arg_path: Vec<PathBuf>,
+}
+
 fn main() -> Result<()> {
-    let target: PathBuf = std::env::args().nth(1).ok_or(anyhow!("Usage: rmp <file-or-directory>"))?.into();
+    let args: Args = Docopt::new(usage())
+        .and_then(|d| d.deserialize())
+        .unwrap_or_else(|e| e.exit());
 
     let (to_delete_tx, to_delete_rx) = sync_channel(1_000_000);
 
@@ -28,8 +48,12 @@ fn main() -> Result<()> {
     let finder = thread::spawn({
         let progress = progress.clone();
         let total = total.clone();
+        let paths = args.arg_path.clone();
         move || -> Result<()> {
-            let stats = find(target, &to_delete_tx)?;
+            let mut stats = Stats::default();
+            for path in paths {
+                stats += find(path, &to_delete_tx)?;
+            }
             *total.write().unwrap() = stats;
             progress.set_length(stats.files);
             progress.set_style(ProgressStyle::with_template("{elapsed_precise} {wide_bar:.on_cyan/on_17} {eta_precise}").unwrap()
