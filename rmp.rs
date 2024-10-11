@@ -20,16 +20,18 @@ fn usage() -> String {
     format!(r#"
 Usage:
   rmp --help
-  rmp <path>...
+  rmp [options] <path>...
 
 Options:
-  -h, --help               Show this screen.
+  -h, --help         Show this screen.
+  -n, --dry-run      Don't delete anything, but go through the motions as if it were.
 "#)
 }
 
 #[derive(Debug, Deserialize)]
 struct Args {
-    arg_path: Vec<PathBuf>,
+    flag_dry_run:     bool,
+    arg_path:         Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -76,14 +78,22 @@ fn main() -> Result<()> {
             Ok(ToDelete::File { size, path }) => {
                 //remove_file(&path)?;
                 sleep(Duration::from_micros(1000));
+                if args.flag_dry_run {
+                    sleep(Duration::from_micros(1000));
+                } else {
+                    remove_file(&path)?;
+                }
                 path_spinner.set_message((*path.to_string_lossy()).to_owned());
                 path_spinner.set_prefix("rm");
                 done.bytes += size;
                 done.files += 1;
             },
             Ok(ToDelete::Dir(path)) => {
-                //remove_dir(&path)?;
-                sleep(Duration::from_micros(80));
+                if args.flag_dry_run {
+                    sleep(Duration::from_micros(80));
+                } else {
+                    remove_dir(&path)?;
+                }
                 path_spinner.set_message((*path.to_string_lossy()).to_owned());
                 path_spinner.set_prefix("rmdir");
                 done.dirs += 1;
