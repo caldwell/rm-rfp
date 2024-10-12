@@ -12,3 +12,6 @@ anyhow = "1"
 indicatif = "0.17"
 docopt = "1"
 serde = { version = "1.0", features = ["derive"] } # for docopt
+
+[dev-dependencies]
+tempfile = "3"
