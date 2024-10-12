@@ -1,6 +1,7 @@
 // Copyright © 2024 David Caldwell <david@porkrind.org>
 
 use std::{fs::{read_dir, remove_dir, remove_file},
+          io::{IsTerminal, Write},
           panic,
           path::{Path, PathBuf},
           sync::{atomic::{AtomicBool, AtomicU64, Ordering},
@@ -25,14 +26,16 @@ Usage:
   rm-rfp [options] <path>...
 
 Options:
-  -h, --help         Show this screen.
-  -n, --dry-run      Don't delete anything, but go through the motions as if it were.
+  -h, --help          Show this screen.
+  -n, --dry-run       Don't delete anything, but go through the motions as if it were.
+  -i, --interactive   Prompt before deleting each file.
 "#)
 }
 
 #[derive(Debug, Deserialize)]
 struct Args {
     flag_dry_run:     bool,
+    flag_interactive: bool,
     arg_path:         Vec<PathBuf>,
 }
 
@@ -69,30 +72,59 @@ fn main() -> Result<()> {
     });
 
     let mut done = Stats::default();
+    let mut interactive_state = None;
     loop {
         match to_delete_rx.recv() {
-            Ok(ToDelete::File { size, path }) => {
-                //remove_file(&path)?;
-                sleep(Duration::from_micros(1000));
-                if args.flag_dry_run {
-                    sleep(Duration::from_micros(1000));
-                } else {
-                    remove_file(&path)?;
+            | Ok(ref f @ ToDelete::File { .. })
+            | Ok(ref f @ ToDelete::Dir(_)) => {
+                match (args.flag_interactive, &interactive_state, f) {
+                    (false, _, _) => { /* delete */ },
+                    (true, Some(Directive::DeleteFromNowOn), _) => { /* delete */ },
+                    | (true, Some(Directive::SkipThisDir(ref skip)), ToDelete::File { ref path, .. })
+                    | (true, Some(Directive::SkipThisDir(ref skip)), ToDelete::Dir(ref path))
+                        if is_same_dir(skip, path) => { continue },
+                    | (true, Some(Directive::DeleteThisDir(ref skip)), ToDelete::File { ref path, .. })
+                    | (true, Some(Directive::DeleteThisDir(ref skip)), ToDelete::Dir(ref path))
+                        if is_same_dir(skip, path) => { /* delete */ },
+                    (_, _, _) => {
+                        match multi.suspend(|| ask(&f))? {
+                            Directive::Delete => {},
+                            Directive::Skip => continue,
+                            Directive::Quit => break,
+                            d@Directive::DeleteFromNowOn |
+                            d@Directive::DeleteThisDir(_) =>  { interactive_state = Some(d) },
+                            d@Directive::SkipThisDir(_) =>  { interactive_state = Some(d); continue },
+                        }
+                    }
                 }
-                path_spinner.set_message((*path.to_string_lossy()).to_owned());
-                path_spinner.set_prefix("rm");
-                done.bytes += size;
-                done.files += 1;
-            },
-            Ok(ToDelete::Dir(path)) => {
-                if args.flag_dry_run {
-                    sleep(Duration::from_micros(80));
-                } else {
-                    remove_dir(&path)?;
+                match f {
+                    ToDelete::File { size, path } => {
+                        if args.flag_dry_run {
+                            sleep(Duration::from_micros(1000));
+                        } else {
+                            if let Err(e) = remove_file(&path) {
+                                _ = multi.println(format!("Couldn't remove {path:?}: {e}"));
+                            }
+                        }
+                        path_spinner.set_message((*path.to_string_lossy()).to_owned());
+                        path_spinner.set_prefix("rm");
+                        done.bytes += size;
+                        done.files += 1;
+                    },
+                    ToDelete::Dir(path) => {
+                        if args.flag_dry_run {
+                            sleep(Duration::from_micros(80));
+                        } else {
+                            if let Err(e) = remove_dir(&path) {
+                                _ = multi.println(format!("Couldn't remove directory {path:?}: {e}"));
+                            }
+                        }
+                        path_spinner.set_message((*path.to_string_lossy()).to_owned());
+                        path_spinner.set_prefix("rmdir");
+                        done.dirs += 1;
+                    },
+                    ToDelete::Err { .. } => unreachable!(),
                 }
-                path_spinner.set_message((*path.to_string_lossy()).to_owned());
-                path_spinner.set_prefix("rmdir");
-                done.dirs += 1;
             },
             Ok(ToDelete::Err { path, err }) => {
                 _ = multi.println(format!("{path:?}: {err}"));
@@ -205,4 +237,85 @@ fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<(), (Pa
         TOTAL.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
     Ok(())
+}
+
+enum Directive {
+    Delete,
+    Skip,
+    DeleteFromNowOn,
+    Quit,
+    DeleteThisDir(PathBuf),
+    SkipThisDir(PathBuf),
+}
+
+fn ask(item: &ToDelete) -> Result<Directive> {
+    let (path, prompt) = match item {
+        ToDelete::File { size, path } => {
+            #[cfg(unix)]
+            use std::os::unix::fs::FileTypeExt;
+            let ft = path.symlink_metadata().map_err(|e| anyhow!("interactive: stat {path:?}: {e}"))?.file_type();
+            (path,
+             if ft.is_file() && *size == 0 {
+                 format!("remove empty file {path:?}")
+             } else if ft.is_file() {
+                 format!("remove file {path:?} [{}]", HumanBytes(*size))
+             } else if ft.is_symlink() {
+                 format!("remove symbolic link {path:?}")
+             } else {
+                 #[cfg(unix)]
+                 if ft.is_fifo() {
+                     format!("remove fifo {path:?}")
+                 } else if ft.is_socket() {
+                     format!("remove socket {path:?}")
+                 } else if ft.is_char_device() {
+                     format!("remove character device {path:?}")
+                 } else if ft.is_block_device() {
+                     format!("remove block device {path:?}")
+                 } else {
+                     format!("remove unknown file {path:?}") // can't happen?
+                 }
+
+                 #[cfg(not(unix))]
+                 format!("remove {path:?}")
+             })
+        }
+        ToDelete::Dir(path) => (path, format!("remove dir {}", path.to_string_lossy())),
+        ToDelete::Err { .. } => unreachable!(),
+    };
+    loop {
+        print!("{}? (y/N/a/q/d/s/?) ", prompt);
+        _ = std::io::stdout().flush();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !std::io::stdout().is_terminal() { print!("\n") } // hack to make tests easier
+        match input.to_lowercase().trim() {
+            "y" => return Ok(Directive::Delete),
+            ""  | /* default */
+            "n" => return Ok(Directive::Skip),
+            "a" => return Ok(Directive::DeleteFromNowOn),
+            "q" => return Ok(Directive::Quit),
+            "d" => return Ok(Directive::DeleteThisDir(path.to_owned())),
+            "s" => return Ok(Directive::SkipThisDir(path.to_owned())),
+            "?" => println!("y - Yes, delete it\n\
+                             n - No, don't delete it\n\
+                             a - Delete this and everything else (without any further prompts)\n\
+                             q - Quit without deleting this nor anything else\n\
+                             d - Delete this and the rest of its directory without further prompts\n\
+                             s - Don't delete this or anything else in its directory, but continue asking about other items\n\
+                             ? - Show help"),
+            _ => println!("Bad input. Enter \"?\" for help"),
+        }
+    }
+}
+
+fn is_same_dir(p1: &Path, p2: &Path) -> bool {
+    match (p1.parent(), p2) {
+        (Some(dir), path) => {
+            for p in path.ancestors() {
+                if p == dir { return true }
+            }
+            false
+        },
+        (None, _) => false,
+    }
 }
