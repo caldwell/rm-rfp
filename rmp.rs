@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         move || -> Result<()> {
             let mut stats = Stats::default();
             for path in paths {
-                stats += find(path, &to_delete_tx)?;
+                stats += find(path, &to_delete_tx).map_err(|(path, err)| anyhow!("{path:?};{err}"))?
             }
             *total.write().unwrap() = stats;
             progress.set_length(stats.files);
@@ -153,16 +153,50 @@ enum ToDelete {
     Err { path: PathBuf, err: Error },
 }
 
-fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> Result<Stats> {
+fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<Stats, (PathBuf, anyhow::Error)> {
     let mut stats = Stats::default();
-    let meta = (&path).symlink_metadata().map_err(|e| anyhow!("stat: {e}"))?;
+    let meta = (&path).symlink_metadata().map_err(|e| (path.clone(), anyhow!("stat: {e}")))?;
+    let channel_closed = |e: std::sync::mpsc::SendError<ToDelete>|
+        (match e.0 {
+            ToDelete::File { path, .. } |
+            ToDelete::Dir(path) |
+            ToDelete::Err { path, .. } => path,
+        }, anyhow!("finder tx channel was closed"));
+
     if meta.is_dir() {
-        let ctx = |e| anyhow!("read_dir: {e}");
-        for f in read_dir(&path).map_err(ctx)? {
-            let dirent = f.map_err(ctx)?;
-            match find(dirent.path(), tx) {
-                Ok(s) => stats += s,
-                Err(err) => tx.send(ToDelete::Err { path: dirent.path(), err })?,
+        let ctx = |e| (path.clone(), anyhow!("read_dir: {e}"));
+
+        // Sort the entries so the user can tell how far we've gotten even if the progress bar isn't
+        // going. However, don't waste time and memory sorting directories that are massive. If you've ever
+        // done "ls" in a directory and had it take multiple seconds before printing anything you know what
+        // we're trying to avoid here. The cutoff point is somewhat arbitrary. We want it high enough that
+        // most things get sorted but low enough that the time and memory spent reading the entries and
+        // sorting is negligible.
+        //
+        // If the we're unix we can get the number of directory entries quickly from the nlink stat field. If
+        // we're not, then don't bother sorting.
+        #[cfg(unix)] use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)] let nlink = meta.nlink() as usize;
+        #[cfg(not(unix))] let nlink = 5000_usize;
+        if nlink < 5000 {
+            let mut dirents = Vec::with_capacity(nlink); // oversized by 2 (., ..) but who cares.
+            for f in read_dir(&path).map_err(ctx)? {
+                dirents.push(f.map_err(ctx)?.path());
+            }
+            dirents.sort();
+            for f in dirents.into_iter() {
+                match find(f, tx) {
+                    Ok(s) => stats += s,
+                    Err((path, err)) => tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?,
+                }
+            }
+        } else {
+            for f in read_dir(&path).map_err(ctx)? {
+                let dirent = f.map_err(ctx)?;
+                match find(dirent.path(), tx) {
+                    Ok(s) => stats += s,
+                    Err((path, err)) => tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?,
+                }
             }
         }
         {
@@ -170,10 +204,10 @@ fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> Result<Stats> {
             tot.dirs += 1;
             stats.dirs += 1;
         }
-        tx.send(ToDelete::Dir(path))?;
+        tx.send(ToDelete::Dir(path)).map_err(channel_closed)?;
     } else { // symlinks are more or less just files
         let bytes = meta.len();
-        tx.send(ToDelete::File { path, size: bytes })?;
+        tx.send(ToDelete::File { path, size: bytes }).map_err(channel_closed)?;
         stats += Stats { bytes, files: 1, dirs: 0 };
         {
             let mut tot = TOTAL.get().unwrap().write().unwrap();
