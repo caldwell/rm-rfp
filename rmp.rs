@@ -2,10 +2,9 @@
 
 use std::{fs::{read_dir, remove_dir, remove_file},
           panic,
-          path::PathBuf,
-          sync::OnceLock,
-          sync::{mpsc::{sync_channel, SyncSender},
-                 Arc, RwLock},
+          path::{Path, PathBuf},
+          sync::{atomic::{AtomicBool, AtomicU64, Ordering},
+                 mpsc::{sync_channel, SyncSender}},
           thread::{self, sleep},
           time::Duration};
 
@@ -14,7 +13,10 @@ use docopt::Docopt;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
-static TOTAL: OnceLock<RwLock<Stats>> = OnceLock::new();
+static TOTAL: AtomicStats = AtomicStats { bytes: AtomicU64::new(0),
+                                          files: AtomicU64::new(0),
+                                          dirs : AtomicU64::new(0),
+                                          done : AtomicBool::new(false) };
 
 fn usage() -> String {
     format!(r#"
@@ -50,21 +52,16 @@ fn main() -> Result<()> {
     multi.add(progress.clone());
     multi.add(path_spinner.clone());
     multi.add(totals.clone());
-    let total = Arc::new(RwLock::new(Stats::default()));
-
-    TOTAL.get_or_init(|| RwLock::new(Stats::default()));
 
     let finder = thread::spawn({
         let progress = progress.clone();
-        let total = total.clone();
         let paths = args.arg_path.clone();
         move || -> Result<()> {
-            let mut stats = Stats::default();
             for path in paths {
-                stats += find(path, &to_delete_tx).map_err(|(path, err)| anyhow!("{path:?};{err}"))?
+                find(path, &to_delete_tx).map_err(|(path, err)| anyhow!("{path:?};{err}"))?
             }
-            *total.write().unwrap() = stats;
-            progress.set_length(stats.files);
+            TOTAL.done.store(true, Ordering::Relaxed);
+            progress.set_length(TOTAL.files.load(Ordering::Relaxed));
             progress.set_style(ProgressStyle::with_template("{elapsed_precise} {wide_bar:.on_cyan/on_17} {eta_precise}").unwrap()
                                                                                                                         .progress_chars("   "));
             Ok(())
@@ -104,8 +101,11 @@ fn main() -> Result<()> {
                 break
             },
         }
-        match *(total.read().unwrap()) {
-            Stats { bytes, files, dirs } if bytes != 0 || files != 0 || dirs != 0 => {
+        match (TOTAL.done.load(Ordering::Relaxed),
+               TOTAL.bytes.load(Ordering::Relaxed),
+               TOTAL.files.load(Ordering::Relaxed),
+               TOTAL.dirs.load(Ordering::Relaxed)) {
+            (true, bytes, files, dirs) => {
                 totals.set_message(format!("Total: freed: {}/{}, directories removed: {}/{}, files removed: {}/{}",
                                            HumanBytes(done.bytes), HumanBytes(bytes),
                                            done.dirs, dirs,
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
             },
         }
         progress.set_position(done.files);
-        progress.set_length(TOTAL.get().unwrap().read().unwrap().files);
+        progress.set_length(TOTAL.files.load(Ordering::Relaxed));
     }
 
     totals.finish();
@@ -131,6 +131,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+
+struct AtomicStats {
+    bytes: AtomicU64,
+    files: AtomicU64,
+    dirs:  AtomicU64,
+    done:  AtomicBool,
+}
+
 #[derive(Default, Clone, Copy)]
 struct Stats {
     bytes: u64,
@@ -138,13 +146,6 @@ struct Stats {
     dirs:  u64,
 }
 
-impl std::ops::AddAssign for Stats {
-    fn add_assign(&mut self, rhs: Self) {
-        self.bytes += rhs.bytes;
-        self.files += rhs.files;
-        self.dirs  += rhs.dirs;
-    }
-}
 
 enum ToDelete {
     File { size: u64, path: PathBuf },
@@ -152,8 +153,7 @@ enum ToDelete {
     Err { path: PathBuf, err: Error },
 }
 
-fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<Stats, (PathBuf, anyhow::Error)> {
-    let mut stats = Stats::default();
+fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<(), (PathBuf, anyhow::Error)> {
     let meta = (&path).symlink_metadata().map_err(|e| (path.clone(), anyhow!("stat: {e}")))?;
     let channel_closed = |e: std::sync::mpsc::SendError<ToDelete>|
         (match e.0 {
@@ -184,35 +184,25 @@ fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<Stats, 
             }
             dirents.sort();
             for f in dirents.into_iter() {
-                match find(f, tx) {
-                    Ok(s) => stats += s,
-                    Err((path, err)) => tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?,
+                if let Err((path,err)) = find(f, tx) {
+                    tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
                 }
             }
         } else {
             for f in read_dir(&path).map_err(ctx)? {
                 let dirent = f.map_err(ctx)?;
-                match find(dirent.path(), tx) {
-                    Ok(s) => stats += s,
-                    Err((path, err)) => tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?,
+                if let Err((path, err)) = find(dirent.path(), tx) {
+                    tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
                 }
             }
         }
-        {
-            let mut tot = TOTAL.get().unwrap().write().unwrap();
-            tot.dirs += 1;
-            stats.dirs += 1;
-        }
+        TOTAL.dirs.fetch_add(1, Ordering::Relaxed);
         tx.send(ToDelete::Dir(path)).map_err(channel_closed)?;
     } else { // symlinks are more or less just files
         let bytes = meta.len();
         tx.send(ToDelete::File { path, size: bytes }).map_err(channel_closed)?;
-        stats += Stats { bytes, files: 1, dirs: 0 };
-        {
-            let mut tot = TOTAL.get().unwrap().write().unwrap();
-            tot.files += 1;
-            tot.bytes += bytes;
-        }
+        TOTAL.files.fetch_add(1, Ordering::Relaxed);
+        TOTAL.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
-    Ok(stats)
+    Ok(())
 }
