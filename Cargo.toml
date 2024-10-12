@@ -1,11 +1,11 @@
 [package]
-name = "rmp"
+name = "rm-rfp"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "rmp"
-path = "rmp.rs"
+name = "rm-rfp"
+path = "rm-rfp.rs"
 
 [dependencies]
 anyhow = "1"

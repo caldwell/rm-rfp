@@ -21,8 +21,8 @@ static TOTAL: AtomicStats = AtomicStats { bytes: AtomicU64::new(0),
 fn usage() -> String {
     format!(r#"
 Usage:
-  rmp --help
-  rmp [options] <path>...
+  rm-rfp --help
+  rm-rfp [options] <path>...
 
 Options:
   -h, --help         Show this screen.
