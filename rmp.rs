@@ -43,6 +43,13 @@ fn main() -> Result<()> {
 
     let progress = ProgressBar::new_spinner().with_style(ProgressStyle::with_template("Counting files{spinner:3}  {len}").unwrap()
                                                                                                                          .tick_strings(&[".", "..", "...", ""]));
+    let path_spinner = ProgressBar::new_spinner().with_style(ProgressStyle::with_template("{spinner} {prefix:<5.245} {msg:!.214}").unwrap());
+    path_spinner.enable_steady_tick(Duration::from_secs_f32(1.0 / 10.0));
+    let totals = ProgressBar::new_spinner().with_style(ProgressStyle::with_template("{msg}, elapsed: {elapsed_precise}")?);
+    let multi = MultiProgress::new();
+    multi.add(progress.clone());
+    multi.add(path_spinner.clone());
+    multi.add(totals.clone());
     let total = Arc::new(RwLock::new(Stats::default()));
 
     TOTAL.get_or_init(|| RwLock::new(Stats::default()));
@@ -63,14 +70,6 @@ fn main() -> Result<()> {
             Ok(())
         }
     });
-
-    let path_spinner = ProgressBar::new_spinner().with_style(ProgressStyle::with_template("{spinner} {prefix:<5.245} {msg:!.214}").unwrap());
-    path_spinner.enable_steady_tick(Duration::from_secs_f32(1.0 / 10.0));
-    let totals = ProgressBar::new_spinner().with_style(ProgressStyle::with_template("{msg}, elapsed: {elapsed_precise}")?);
-    let multi = MultiProgress::new();
-    multi.add(progress.clone());
-    multi.add(path_spinner.clone());
-    multi.add(totals.clone());
 
     let mut done = Stats::default();
     loop {
