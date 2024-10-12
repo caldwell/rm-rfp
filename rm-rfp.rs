@@ -185,14 +185,18 @@ enum ToDelete {
     Err { path: PathBuf, err: Error },
 }
 
+impl ToDelete {
+    fn path(self) -> PathBuf {
+        match self {
+            ToDelete::File { path, .. } | ToDelete::Dir(path) | ToDelete::Err { path, .. } => path
+        }
+    }
+}
+
 fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<(), (PathBuf, anyhow::Error)> {
     let meta = (&path).symlink_metadata().map_err(|e| (path.clone(), anyhow!("stat: {e}")))?;
     let channel_closed = |e: std::sync::mpsc::SendError<ToDelete>|
-        (match e.0 {
-            ToDelete::File { path, .. } |
-            ToDelete::Dir(path) |
-            ToDelete::Err { path, .. } => path,
-        }, anyhow!("finder tx channel was closed"));
+        (e.0.path(), anyhow!("finder tx channel was closed"));
 
     if meta.is_dir() {
         let ctx = |e| (path.clone(), anyhow!("read_dir: {e}"));
