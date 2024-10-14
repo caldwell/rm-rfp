@@ -60,8 +60,9 @@ fn main() -> Result<()> {
         let progress = progress.clone();
         let paths = args.arg_path.clone();
         move || -> Result<()> {
+            let mut finder = Find::new(&to_delete_tx);
             for path in paths {
-                find(path, &to_delete_tx).map_err(|(path, err)| anyhow!("{path:?};{err}"))?
+                finder.find(path).map_err(|(path, err)| anyhow!("{path:?};{err}"))?
             }
             TOTAL.done.store(true, Ordering::Relaxed);
             progress.set_length(TOTAL.files.load(Ordering::Relaxed));
@@ -193,32 +194,42 @@ impl ToDelete {
     }
 }
 
+struct Find<'a> {
+    tx: &'a SyncSender<ToDelete>,
+}
+
 type FindResult<T> = std::result::Result<T, (PathBuf, anyhow::Error)>;
 
-fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> FindResult<()> {
+impl<'a> Find<'a> {
+    fn new(tx: &'a SyncSender<ToDelete>) -> Find<'a> {
+        Find {
+            tx,
+        }
+    }
+  fn find(&mut self, path: PathBuf) -> FindResult<()> {
     let meta = (&path).symlink_metadata().map_err(|e| (path.clone(), anyhow!("stat: {e}")))?;
     fn channel_closed(e: std::sync::mpsc::SendError<ToDelete>) -> (PathBuf, anyhow::Error) {
         (e.0.path(), anyhow!("finder tx channel was closed"))
     }
 
     if meta.is_dir() {
-        for dirent in readdir_sorted(&path, &meta)? {
-            if let Err((path, err)) = find(dirent?, tx) {
-                tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
+        for dirent in Self::readdir_sorted(&path, &meta)? {
+            if let Err((path, err)) = self.find(dirent?) {
+                self.tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
             }
         }
         TOTAL.dirs.fetch_add(1, Ordering::Relaxed);
-        tx.send(ToDelete::Dir(path)).map_err(channel_closed)?;
+        self.tx.send(ToDelete::Dir(path)).map_err(channel_closed)?;
     } else { // symlinks are more or less just files
         let bytes = meta.len();
-        tx.send(ToDelete::File { path, size: bytes }).map_err(channel_closed)?;
+        self.tx.send(ToDelete::File { path, size: bytes }).map_err(channel_closed)?;
         TOTAL.files.fetch_add(1, Ordering::Relaxed);
         TOTAL.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
     Ok(())
-}
+  }
 
-fn readdir_sorted<'a>(path: &'a Path, meta: &Metadata) -> FindResult<Box<dyn Iterator<Item=FindResult<PathBuf>> + 'a>> {
+  fn readdir_sorted<'p>(path: &'p Path, meta: &Metadata) -> FindResult<Box<dyn Iterator<Item=FindResult<PathBuf>> + 'p>> {
     let ctx = |e| (path.to_owned(), anyhow!("read_dir: {e}"));
 
     // Sort the entries so the user can tell how far we've gotten even if the progress bar isn't
@@ -247,6 +258,7 @@ fn readdir_sorted<'a>(path: &'a Path, meta: &Metadata) -> FindResult<Box<dyn Ite
                                           .map(|res_de| res_de.map(|de| de.path())
                                                               .map_err(|e| (path.to_owned(), anyhow!(e))))))
     }
+  }
 }
 
 enum Directive {
