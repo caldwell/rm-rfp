@@ -1,6 +1,6 @@
 // Copyright © 2024 David Caldwell <david@porkrind.org>
 
-use std::{fs::{read_dir, remove_dir, remove_file},
+use std::{fs::{read_dir, remove_dir, remove_file, Metadata},
           io::{IsTerminal, Write},
           panic,
           path::{Path, PathBuf},
@@ -193,43 +193,18 @@ impl ToDelete {
     }
 }
 
-fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<(), (PathBuf, anyhow::Error)> {
+type FindResult<T> = std::result::Result<T, (PathBuf, anyhow::Error)>;
+
+fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> FindResult<()> {
     let meta = (&path).symlink_metadata().map_err(|e| (path.clone(), anyhow!("stat: {e}")))?;
-    let channel_closed = |e: std::sync::mpsc::SendError<ToDelete>|
-        (e.0.path(), anyhow!("finder tx channel was closed"));
+    fn channel_closed(e: std::sync::mpsc::SendError<ToDelete>) -> (PathBuf, anyhow::Error) {
+        (e.0.path(), anyhow!("finder tx channel was closed"))
+    }
 
     if meta.is_dir() {
-        let ctx = |e| (path.clone(), anyhow!("read_dir: {e}"));
-
-        // Sort the entries so the user can tell how far we've gotten even if the progress bar isn't
-        // going. However, don't waste time and memory sorting directories that are massive. If you've ever
-        // done "ls" in a directory and had it take multiple seconds before printing anything you know what
-        // we're trying to avoid here. The cutoff point is somewhat arbitrary. We want it high enough that
-        // most things get sorted but low enough that the time and memory spent reading the entries and
-        // sorting is negligible.
-        //
-        // If the we're unix we can get the number of directory entries quickly from the nlink stat field. If
-        // we're not, then don't bother sorting.
-        #[cfg(unix)] use std::os::unix::fs::MetadataExt;
-        #[cfg(unix)] let nlink = meta.nlink() as usize;
-        #[cfg(not(unix))] let nlink = 5000_usize;
-        if nlink < 5000 {
-            let mut dirents = Vec::with_capacity(nlink); // oversized by 2 (., ..) but who cares.
-            for f in read_dir(&path).map_err(ctx)? {
-                dirents.push(f.map_err(ctx)?.path());
-            }
-            dirents.sort();
-            for f in dirents.into_iter() {
-                if let Err((path,err)) = find(f, tx) {
-                    tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
-                }
-            }
-        } else {
-            for f in read_dir(&path).map_err(ctx)? {
-                let dirent = f.map_err(ctx)?;
-                if let Err((path, err)) = find(dirent.path(), tx) {
-                    tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
-                }
+        for dirent in readdir_sorted(&path, &meta)? {
+            if let Err((path, err)) = find(dirent?, tx) {
+                tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
             }
         }
         TOTAL.dirs.fetch_add(1, Ordering::Relaxed);
@@ -241,6 +216,37 @@ fn find(path: PathBuf, tx: &SyncSender<ToDelete>) -> std::result::Result<(), (Pa
         TOTAL.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
     Ok(())
+}
+
+fn readdir_sorted<'a>(path: &'a Path, meta: &Metadata) -> FindResult<Box<dyn Iterator<Item=FindResult<PathBuf>> + 'a>> {
+    let ctx = |e| (path.to_owned(), anyhow!("read_dir: {e}"));
+
+    // Sort the entries so the user can tell how far we've gotten even if the progress bar isn't
+    // going. However, don't waste time and memory sorting directories that are massive. If you've ever
+    // done "ls" in a directory and had it take multiple seconds before printing anything you know what
+    // we're trying to avoid here. The cutoff point is somewhat arbitrary. We want it high enough that
+    // most things get sorted but low enough that the time and memory spent reading the entries and
+    // sorting is negligible.
+    //
+    // If the we're unix we can get the number of directory entries quickly from the nlink stat field. If
+    // we're not, then don't bother sorting.
+    #[cfg(unix)] use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)] let nlink = meta.nlink() as usize;
+    #[cfg(not(unix))] let nlink = 5000_usize;
+    if nlink < 5000 {
+        let mut dirents = Vec::with_capacity(nlink); // oversized by 2 (., ..) but who cares.
+
+        for f in read_dir(&path).map_err(ctx)? {
+            dirents.push(f.map_err(ctx)?.path());
+        }
+        dirents.sort();
+
+        return Ok(Box::new(dirents.into_iter().map(|ent| Ok(ent))));
+    } else {
+        return Ok(Box::new(read_dir(&path).map_err(ctx)?
+                                          .map(|res_de| res_de.map(|de| de.path())
+                                                              .map_err(|e| (path.to_owned(), anyhow!(e))))))
+    }
 }
 
 enum Directive {
