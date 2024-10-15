@@ -59,10 +59,13 @@ fn main() -> Result<()> {
     let finder = thread::spawn({
         let progress = progress.clone();
         let paths = args.arg_path.clone();
+        let multi = multi.clone();
         move || -> Result<()> {
-            let mut finder = Find::new(&to_delete_tx);
+            let interactive = Interactive::new(args.flag_interactive, move |f| multi.suspend(|| f()));
+            let mut finder = Find::new(&to_delete_tx, interactive);
             for path in paths {
-                finder.find(path).map_err(|(path, err)| anyhow!("{path:?};{err}"))?
+                finder.find(path).map_err(|(path, err)| anyhow!("{path:?};{err}"))?;
+                finder.interactive.reset_state();
             }
             TOTAL.done.store(true, Ordering::Relaxed);
             progress.set_length(TOTAL.files.load(Ordering::Relaxed));
@@ -73,43 +76,28 @@ fn main() -> Result<()> {
     });
 
     let mut done = Stats::default();
-    let mut interactive = Interactive::new(args.flag_interactive, { let multi = multi.clone();
-                                                                    move |f| multi.suspend(|| f()) });
     loop {
         match to_delete_rx.recv() {
-            | Ok(ref f @ ToDelete::File { ref path, .. })
-            | Ok(ref f @ ToDelete::Dir(ref path)) => {
-                let meta = path.symlink_metadata()?;
-                if interactive.ask(&path, &meta, false).map_err(|e| e.1)? == Directive::Skip { continue }
-
-                match f {
-                    ToDelete::File { size, path } => {
-                        if args.flag_dry_run {
-                            sleep(Duration::from_micros(1000));
-                        } else {
-                            if let Err(e) = remove_file(&path) {
-                                _ = multi.println(format!("Couldn't remove {path:?}: {e}"));
-                            }
-                        }
-                        path_spinner.set_message((*path.to_string_lossy()).to_owned());
-                        path_spinner.set_prefix("rm");
-                        done.bytes += size;
-                        done.files += 1;
-                    },
-                    ToDelete::Dir(path) => {
-                        if args.flag_dry_run {
-                            sleep(Duration::from_micros(80));
-                        } else {
-                            if let Err(e) = remove_dir(&path) {
-                                _ = multi.println(format!("Couldn't remove directory {path:?}: {e}"));
-                            }
-                        }
-                        path_spinner.set_message((*path.to_string_lossy()).to_owned());
-                        path_spinner.set_prefix("rmdir");
-                        done.dirs += 1;
-                    },
-                    ToDelete::Err { .. } => unreachable!(),
+            Ok(ToDelete::File { size, path }) => {
+                if args.flag_dry_run {
+                    sleep(Duration::from_micros(1000));
+                } else {
+                    remove_file(&path)?;
                 }
+                path_spinner.set_message((*path.to_string_lossy()).to_owned());
+                path_spinner.set_prefix("rm");
+                done.bytes += size;
+                done.files += 1;
+            },
+            Ok(ToDelete::Dir(path)) => {
+                if args.flag_dry_run {
+                    sleep(Duration::from_micros(80));
+                } else {
+                    remove_dir(&path)?;
+                }
+                path_spinner.set_message((*path.to_string_lossy()).to_owned());
+                path_spinner.set_prefix("rmdir");
+                done.dirs += 1;
             },
             Ok(ToDelete::Err { path, err }) => {
                 _ = multi.println(format!("{path:?}: {err}"));
@@ -180,28 +168,37 @@ impl ToDelete {
 
 struct Find<'a> {
     tx: &'a SyncSender<ToDelete>,
+    interactive: Interactive,
 }
 
 type FindResult<T> = std::result::Result<T, (PathBuf, anyhow::Error)>;
 
 impl<'a> Find<'a> {
-    fn new(tx: &'a SyncSender<ToDelete>) -> Find<'a> {
-        Find {
-            tx,
-        }
+    fn new(tx: &'a SyncSender<ToDelete>, interactive: Interactive) -> Find<'a> {
+        Find { tx, interactive }
     }
-    fn find(&mut self, path: PathBuf) -> FindResult<()> {
+
+    fn find(&mut self, path: PathBuf) -> FindResult<bool> {
         let meta = (&path).symlink_metadata().map_err(|e| (path.clone(), anyhow!("stat: {e}")))?;
         fn channel_closed(e: std::sync::mpsc::SendError<ToDelete>) -> (PathBuf, anyhow::Error) {
             (e.0.path(), anyhow!("finder tx channel was closed"))
         }
 
+        if self.interactive.ask(&path, &meta, true)? == Directive::Skip { return Ok(true) }
+
         if meta.is_dir() {
+            let mut skipped_any = false;
             for dirent in Self::readdir_sorted(&path, &meta)? {
-                if let Err((path, err)) = self.find(dirent?) {
-                    self.tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?;
+                match self.find(dirent?) {
+                    Err((path, err)) => self.tx.send(ToDelete::Err { path, err }).map_err(channel_closed)?,
+                    Ok(true) => skipped_any = true,
+                    Ok(false) => {},
                 }
             }
+
+            if skipped_any { return Ok(true) } // Directory is not empty so don't bother asking or trying to delete it.
+            if self.interactive.ask(&path, &meta, true)? == Directive::Skip { return Ok(true) }
+
             TOTAL.dirs.fetch_add(1, Ordering::Relaxed);
             self.tx.send(ToDelete::Dir(path)).map_err(channel_closed)?;
         } else { // symlinks are more or less just files
@@ -210,7 +207,7 @@ impl<'a> Find<'a> {
             TOTAL.files.fetch_add(1, Ordering::Relaxed);
             TOTAL.bytes.fetch_add(bytes, Ordering::Relaxed);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn readdir_sorted<'p>(path: &'p Path, meta: &Metadata) -> FindResult<Box<dyn Iterator<Item=FindResult<PathBuf>> + 'p>> {
@@ -278,6 +275,19 @@ impl Interactive {
             enable,
             ask_ctx: Box::new(ask_ctx),
             state: None,
+        }
+    }
+
+    /// Called between args to reset the state of DeleteThisDir or SkipThisDir back to None. The only other
+    /// states that it could be are DeleteFromNowOn and Quit. Neither of these will be reset.
+    ///
+    /// The reasoning is that the args are separate and it might be confusing for "everything in this dir" to
+    /// also mean some argument down the line that we haven't processed yet.
+    pub fn reset_state(&mut self) {
+        match self.state {
+            Some(Response::Quit) |
+            Some(Response::DeleteFromNowOn) => {},
+            _ => { self.state = None },
         }
     }
 

@@ -110,14 +110,32 @@ fn test_delete() {
 #[test]
 fn test_interactive_ynq() {
     let dir = make_test_tree(3).expect("make_test_tree");
-    let inp = "nynyyyynnyyq".chars().map(|c| format!("{c}\n")).collect::<String>();
+    let inp = "yynyynyyyyynyyq".chars().map(|c| format!("{c}\n")).collect::<String>();
     let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
-    if after != Vec::<PathBuf>::new() {
-        print!("{}", out.lines().zip(inp.lines()).map(|(o, i)| format!("{o}{i}\n")).collect::<String>());
-    }
+    print!("{}", out.lines().zip(inp.lines()).map(|(o, i)| format!("{o}{i}\n")).collect::<String>());
     assert_eq!(after, paths(vec!["a/aa", "a/b/bb", "a/b/cc"]));
+    assert_ne!(out.as_str(), "");
+    assert_eq!(err.as_str(), "");
+}
+
+#[test]
+fn test_interactive_multiarg_q() {
+    let dir1 = make_test_tree(3).expect("make_test_tree1");
+    let dir2 = make_test_tree(2).expect("make_test_tree2");
+    let orig2 = find(&dir2.path());
+    let inp = "yynyynyyyyynyyq".chars().map(|c| format!("{c}\n")).collect::<String>();
+    let (out, err) = run(vec!["-i"], vec![dir1.path(),
+                                          dir2.path()], &inp)
+        .expect("rmp failed");
+    let after1 = find(&dir1.path());
+    let after2 = find(&dir2.path());
+    drop(dir1);
+    drop(dir2);
+    print!("{}", out.lines().zip(inp.lines()).map(|(o, i)| format!("{o}{i}\n")).collect::<String>());
+    assert_eq!(after1, paths(vec!["a/aa", "a/b/bb", "a/b/cc"]));
+    assert_eq!(after2, orig2);
     assert_ne!(out.as_str(), "");
     assert_eq!(err.as_str(), "");
 }
@@ -125,7 +143,7 @@ fn test_interactive_ynq() {
 #[test]
 fn test_interactive_a() {
     let dir = make_test_tree(26).expect("make_test_tree");
-    let inp = "nnnyna".chars().map(|c| format!("{c}\n")).collect::<String>();
+    let inp = "yynynnyyna".chars().map(|c| format!("{c}\n")).collect::<String>();
     let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
@@ -138,9 +156,37 @@ fn test_interactive_a() {
 }
 
 #[test]
+fn test_interactive_multiarg_a() {
+    let dir1 = make_test_tree(3).expect("make_test_tree1");
+    let dir2 = make_test_tree(26).expect("make_test_tree");
+    let inp = "nnnna".chars().map(|c| format!("{c}\n")).collect::<String>();
+    let (out, err) = run(vec!["-i"], vec![&dir1.path().join("a/aa"),
+                                          &dir1.path().join("a/b/aa"),
+                                          &dir1.path().join("a/b/bb"),
+                                          &dir1.path().join("a/b/c/bb"),
+                                          &dir1.path().join("a/b/c/aa"),
+                                          &dir1.path().join("a/b/c/cc"),
+                                          &dir1.path().join("a/b/cc"),
+                                          &dir1.path().join("a/bb"),
+                                          &dir1.path().join("a/cc"),
+                                          &dir2.path()], &inp)
+        .expect("rmp failed");
+    let after1 = find(&dir1.path());
+    let after2 = find(&dir2.path());
+    drop(dir1);
+    drop(dir2);
+    print!("{}", out.lines().map(|l| format!("{l}\n")).collect::<String>());
+    //print!("{}", out.lines().zip(inp.lines()).map(|(o, i)| format!("{o}{i}\n")).collect::<String>());
+    assert_eq!(after1, paths(vec!["a/aa", "a/b/aa", "a/b/bb", "a/b/c/bb"]));
+    assert_eq!(after2, paths(vec![]));
+    assert_ne!(out.as_str(), "");
+    assert_eq!(err.as_str(), "");
+}
+
+#[test]
 fn test_interactive_d() {
     let dir = make_test_tree(7).expect("make_test_tree");
-    let inp = "nnnndddq".chars().map(|c| format!("{c}\n")).collect::<String>();
+    let inp = "yynynnyndddq".chars().map(|c| format!("{c}\n")).collect::<String>();
     let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
@@ -155,7 +201,7 @@ fn test_interactive_d() {
 #[test]
 fn test_interactive_s() {
     let dir = make_test_tree(5).expect("make_test_tree");
-    let inp = "yyyysysna".chars().map(|c| format!("{c}\n")).collect::<String>();
+    let inp = "yyyyyyyysysna".chars().map(|c| format!("{c}\n")).collect::<String>();
     let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
