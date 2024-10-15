@@ -73,31 +73,15 @@ fn main() -> Result<()> {
     });
 
     let mut done = Stats::default();
-    let mut interactive_state = None;
+    let mut interactive = Interactive::new(args.flag_interactive, { let multi = multi.clone();
+                                                                    move |f| multi.suspend(|| f()) });
     loop {
         match to_delete_rx.recv() {
-            | Ok(ref f @ ToDelete::File { .. })
-            | Ok(ref f @ ToDelete::Dir(_)) => {
-                match (args.flag_interactive, &interactive_state, f) {
-                    (false, _, _) => { /* delete */ },
-                    (true, Some(Response::DeleteFromNowOn), _) => { /* delete */ },
-                    | (true, Some(Response::SkipThisDir(ref skip)), ToDelete::File { ref path, .. })
-                    | (true, Some(Response::SkipThisDir(ref skip)), ToDelete::Dir(ref path))
-                        if is_same_dir(skip, path) => { continue },
-                    | (true, Some(Response::DeleteThisDir(ref skip)), ToDelete::File { ref path, .. })
-                    | (true, Some(Response::DeleteThisDir(ref skip)), ToDelete::Dir(ref path))
-                        if is_same_dir(skip, path) => { /* delete */ },
-                    (_, _, _) => {
-                        match multi.suspend(|| ask(&f))? {
-                            Response::Delete => {},
-                            Response::Skip => continue,
-                            Response::Quit => break,
-                            d@Response::DeleteFromNowOn |
-                            d@Response::DeleteThisDir(_) =>  { interactive_state = Some(d) },
-                            d@Response::SkipThisDir(_) =>  { interactive_state = Some(d); continue },
-                        }
-                    }
-                }
+            | Ok(ref f @ ToDelete::File { ref path, .. })
+            | Ok(ref f @ ToDelete::Dir(ref path)) => {
+                let meta = path.symlink_metadata()?;
+                if interactive.ask(&path, &meta, false).map_err(|e| e.1)? == Directive::Skip { continue }
+
                 match f {
                     ToDelete::File { size, path } => {
                         if args.flag_dry_run {
@@ -261,7 +245,8 @@ impl<'a> Find<'a> {
     }
 }
 
-enum Response {
+#[derive(PartialEq, Eq, Debug)]
+pub enum Response {
     Delete,
     Skip,
     DeleteFromNowOn,
@@ -270,17 +255,66 @@ enum Response {
     SkipThisDir(PathBuf),
 }
 
-fn ask(item: &ToDelete) -> Result<Response> {
-    let (path, prompt) = match item {
-        ToDelete::File { size, path } => {
+#[derive(PartialEq, Eq, Debug)]
+pub enum Directive {
+    Delete,
+    Skip,
+}
+
+pub struct Interactive {
+    enable: bool,
+    state: Option<Response>,
+    ask_ctx: AskerContext,
+}
+
+type Asker<'a> = &'a (dyn Fn() -> Result<Response> + 'a);
+type AskerContext = Box<dyn Fn(Asker<'_>) -> Result<Response>>;
+
+impl Interactive {
+    pub fn new<F>(enable: bool, ask_ctx: F) -> Interactive
+    where F: Fn(Asker) -> Result<Response> + 'static,
+    {
+        Interactive {
+            enable,
+            ask_ctx: Box::new(ask_ctx),
+            state: None,
+        }
+    }
+
+    pub fn ask(&mut self, path: &Path, meta: &Metadata, traverse: bool) -> FindResult<Directive> {
+        if self.enable {
+            match &self.state {
+                Some(Response::DeleteFromNowOn)                                    => { return Ok(Directive::Delete) },
+                Some(Response::DeleteThisDir(ref skip)) if is_same_dir(skip, path) => { return Ok(Directive::Delete) },
+                Some(Response::SkipThisDir(ref skip))   if is_same_dir(skip, path) => { return Ok(Directive::Skip) },
+                Some(Response::Quit)                                               => { return Ok(Directive::Skip) },
+                _ => {
+                    match (self.ask_ctx)(&|| self.ask_user(&path, &meta, traverse)).map_err(|e| (path.to_owned(), anyhow!(e)))? {
+                        Response::Delete             => { return Ok(Directive::Delete) },
+                        Response::Skip               => { return Ok(Directive::Skip) },
+                        d@Response::DeleteFromNowOn |
+                        d@Response::DeleteThisDir(_) =>  { self.state = Some(d); return Ok(Directive::Delete) },
+                        d@Response::Quit            |
+                        d@Response::SkipThisDir(_)   =>  { self.state = Some(d); return Ok(Directive::Skip) },
+                    }
+                }
+            }
+        }
+        Ok(Directive::Delete)
+    }
+
+
+  fn ask_user(&self, path: &Path, meta: &Metadata, traverse: bool) -> Result<Response> {
+    let (path, prompt) = match (meta.is_dir(), traverse) {
+        (false, _) => {
             #[cfg(unix)]
             use std::os::unix::fs::FileTypeExt;
-            let ft = path.symlink_metadata().map_err(|e| anyhow!("interactive: stat {path:?}: {e}"))?.file_type();
+            let ft = meta.file_type();
             (path,
-             if ft.is_file() && *size == 0 {
+             if ft.is_file() && meta.len() == 0 {
                  format!("remove empty file {path:?}")
              } else if ft.is_file() {
-                 format!("remove file {path:?} [{}]", HumanBytes(*size))
+                 format!("remove file {path:?} [{}]", HumanBytes(meta.len()))
              } else if ft.is_symlink() {
                  format!("remove symbolic link {path:?}")
              } else {
@@ -301,8 +335,8 @@ fn ask(item: &ToDelete) -> Result<Response> {
                  format!("remove {path:?}")
              })
         }
-        ToDelete::Dir(path) => (path, format!("remove dir {}", path.to_string_lossy())),
-        ToDelete::Err { .. } => unreachable!(),
+        (true, true) => (path, format!("descend into directory {path:?}")),
+        (true, false) => (path, format!("remove directory {path:?}")),
     };
     loop {
         print!("{}? (y/N/a/q/d/s/?) ", prompt);
@@ -328,6 +362,7 @@ fn ask(item: &ToDelete) -> Result<Response> {
             _ => println!("Bad input. Enter \"?\" for help"),
         }
     }
+  }
 }
 
 fn is_same_dir(p1: &Path, p2: &Path) -> bool {
