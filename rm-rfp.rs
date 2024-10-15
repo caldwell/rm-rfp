@@ -80,21 +80,21 @@ fn main() -> Result<()> {
             | Ok(ref f @ ToDelete::Dir(_)) => {
                 match (args.flag_interactive, &interactive_state, f) {
                     (false, _, _) => { /* delete */ },
-                    (true, Some(Directive::DeleteFromNowOn), _) => { /* delete */ },
-                    | (true, Some(Directive::SkipThisDir(ref skip)), ToDelete::File { ref path, .. })
-                    | (true, Some(Directive::SkipThisDir(ref skip)), ToDelete::Dir(ref path))
+                    (true, Some(Response::DeleteFromNowOn), _) => { /* delete */ },
+                    | (true, Some(Response::SkipThisDir(ref skip)), ToDelete::File { ref path, .. })
+                    | (true, Some(Response::SkipThisDir(ref skip)), ToDelete::Dir(ref path))
                         if is_same_dir(skip, path) => { continue },
-                    | (true, Some(Directive::DeleteThisDir(ref skip)), ToDelete::File { ref path, .. })
-                    | (true, Some(Directive::DeleteThisDir(ref skip)), ToDelete::Dir(ref path))
+                    | (true, Some(Response::DeleteThisDir(ref skip)), ToDelete::File { ref path, .. })
+                    | (true, Some(Response::DeleteThisDir(ref skip)), ToDelete::Dir(ref path))
                         if is_same_dir(skip, path) => { /* delete */ },
                     (_, _, _) => {
                         match multi.suspend(|| ask(&f))? {
-                            Directive::Delete => {},
-                            Directive::Skip => continue,
-                            Directive::Quit => break,
-                            d@Directive::DeleteFromNowOn |
-                            d@Directive::DeleteThisDir(_) =>  { interactive_state = Some(d) },
-                            d@Directive::SkipThisDir(_) =>  { interactive_state = Some(d); continue },
+                            Response::Delete => {},
+                            Response::Skip => continue,
+                            Response::Quit => break,
+                            d@Response::DeleteFromNowOn |
+                            d@Response::DeleteThisDir(_) =>  { interactive_state = Some(d) },
+                            d@Response::SkipThisDir(_) =>  { interactive_state = Some(d); continue },
                         }
                     }
                 }
@@ -261,7 +261,7 @@ impl<'a> Find<'a> {
     }
 }
 
-enum Directive {
+enum Response {
     Delete,
     Skip,
     DeleteFromNowOn,
@@ -270,7 +270,7 @@ enum Directive {
     SkipThisDir(PathBuf),
 }
 
-fn ask(item: &ToDelete) -> Result<Directive> {
+fn ask(item: &ToDelete) -> Result<Response> {
     let (path, prompt) = match item {
         ToDelete::File { size, path } => {
             #[cfg(unix)]
@@ -311,13 +311,13 @@ fn ask(item: &ToDelete) -> Result<Directive> {
         std::io::stdin().read_line(&mut input)?;
         if !std::io::stdout().is_terminal() { print!("\n") } // hack to make tests easier
         match input.to_lowercase().trim() {
-            "y" => return Ok(Directive::Delete),
+            "y" => return Ok(Response::Delete),
             ""  | /* default */
-            "n" => return Ok(Directive::Skip),
-            "a" => return Ok(Directive::DeleteFromNowOn),
-            "q" => return Ok(Directive::Quit),
-            "d" => return Ok(Directive::DeleteThisDir(path.to_owned())),
-            "s" => return Ok(Directive::SkipThisDir(path.to_owned())),
+            "n" => return Ok(Response::Skip),
+            "a" => return Ok(Response::DeleteFromNowOn),
+            "q" => return Ok(Response::Quit),
+            "d" => return Ok(Response::DeleteThisDir(path.to_owned())),
+            "s" => return Ok(Response::SkipThisDir(path.to_owned())),
             "?" => println!("y - Yes, delete it\n\
                              n - No, don't delete it\n\
                              a - Delete this and everything else (without any further prompts)\n\
