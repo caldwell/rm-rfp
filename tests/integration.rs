@@ -62,15 +62,19 @@ fn paths(paths: Vec<&str>) -> Vec<PathBuf> {
     paths.into_iter().map(|s| s.into()).collect()
 }
 
-fn run(flags: Vec<&'static str>, args: Vec<&Path>, stdin: &str) -> Result<(String, String)> {
+fn run(flags: Vec<&'static str>, args: Vec<&Path>, stdin: &str, cd: Option<&Path>) -> Result<(String, String)> {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_rm-rfp"));
-    let mut child = Command::new(exe).args(flags)
-                                     .args(args)
-                                     .stdin(Stdio::piped())
-                                     .stdout(Stdio::piped())
-                                     .stderr(Stdio::piped())
-                                     .spawn()
-                                     .expect("Couldn't run {exe:?}");
+    let mut cmd = Command::new(exe);
+    cmd.args(flags)
+       .args(args)
+       .stdin(Stdio::piped())
+       .stdout(Stdio::piped())
+       .stderr(Stdio::piped());
+    if let Some(cd) = cd {
+        cmd.current_dir(cd);
+    }
+    let mut child = cmd.spawn()
+                       .expect("Couldn't run {exe:?}");
     std::thread::spawn({
         let stdin_buf = stdin.to_owned();
         let mut stdin = child.stdin.take().ok_or(anyhow!("Failed to open stdin"))?;
@@ -88,7 +92,7 @@ fn run(flags: Vec<&'static str>, args: Vec<&Path>, stdin: &str) -> Result<(Strin
 fn test_dry_run() {
     let dir = make_test_tree(26).expect("make_test_tree");
     let orig = find(&dir.path());
-    let (out, err) = run(vec!["--dry-run"], vec![dir.path()], "").expect("rmp failed");
+    let (out, err) = run(vec!["--dry-run"], vec![dir.path()], "", None).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
     assert_eq!(after, orig);
@@ -99,7 +103,7 @@ fn test_dry_run() {
 #[test]
 fn test_delete() {
     let dir = make_test_tree(26).expect("make_test_tree");
-    let (out, err) = run(vec![], vec![dir.path()], "").expect("rmp failed");
+    let (out, err) = run(vec![], vec![dir.path()], "", None).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
     assert_eq!(after, Vec::<PathBuf>::new());
@@ -111,7 +115,7 @@ fn test_delete() {
 fn test_interactive_ynq() {
     let dir = make_test_tree(3).expect("make_test_tree");
     let inp = "yynyynyyyyynyyq".chars().map(|c| format!("{c}\n")).collect::<String>();
-    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
+    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp, None).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
     print!("{}", out.lines().zip(inp.lines()).map(|(o, i)| format!("{o}{i}\n")).collect::<String>());
@@ -127,7 +131,7 @@ fn test_interactive_multiarg_q() {
     let orig2 = find(&dir2.path());
     let inp = "yynyynyyyyynyyq".chars().map(|c| format!("{c}\n")).collect::<String>();
     let (out, err) = run(vec!["-i"], vec![dir1.path(),
-                                          dir2.path()], &inp)
+                                          dir2.path()], &inp, None)
         .expect("rmp failed");
     let after1 = find(&dir1.path());
     let after2 = find(&dir2.path());
@@ -144,7 +148,7 @@ fn test_interactive_multiarg_q() {
 fn test_interactive_a() {
     let dir = make_test_tree(26).expect("make_test_tree");
     let inp = "yynynnyyna".chars().map(|c| format!("{c}\n")).collect::<String>();
-    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
+    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp, None).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
     if after != Vec::<PathBuf>::new() {
@@ -169,7 +173,7 @@ fn test_interactive_multiarg_a() {
                                           &dir1.path().join("a/b/cc"),
                                           &dir1.path().join("a/bb"),
                                           &dir1.path().join("a/cc"),
-                                          &dir2.path()], &inp)
+                                          &dir2.path()], &inp, None)
         .expect("rmp failed");
     let after1 = find(&dir1.path());
     let after2 = find(&dir2.path());
@@ -187,7 +191,7 @@ fn test_interactive_multiarg_a() {
 fn test_interactive_d() {
     let dir = make_test_tree(7).expect("make_test_tree");
     let inp = "yynynnyndddq".chars().map(|c| format!("{c}\n")).collect::<String>();
-    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
+    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp, None).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
     if after != Vec::<PathBuf>::new() {
@@ -202,7 +206,7 @@ fn test_interactive_d() {
 fn test_interactive_s() {
     let dir = make_test_tree(5).expect("make_test_tree");
     let inp = "yyyyyyyysysna".chars().map(|c| format!("{c}\n")).collect::<String>();
-    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp).expect("rmp failed");
+    let (out, err) = run(vec!["-i"], vec![dir.path()], &inp, None).expect("rmp failed");
     let after = find(&dir.path());
     drop(dir);
     if after != Vec::<PathBuf>::new() {
@@ -214,4 +218,117 @@ fn test_interactive_s() {
                           "a/b/dd", "a/b/ee", "a/bb"]));
     assert_ne!(out.as_str(), "");
     assert_eq!(err.as_str(), "");
+}
+
+#[test]
+fn test_dot() {
+    let dir = make_test_tree(3).expect("make_test_tree");
+    let before = find(&dir.path());
+    let (out, err) = run(vec!["--dry-run"], vec![Path::new(".")], "", Some(&dir.path())).expect("rm-rfp exec failed");
+    let after = find(&dir.path());
+    assert_eq!(before, after);
+    println!("err={err}\nout={out}");
+    assert_ne!(err.as_str(), "");
+    assert_eq!(out.as_str(), "");
+
+}
+
+#[test]
+fn test_dot_dot() {
+    let dir = make_test_tree(3).expect("make_test_tree");
+    let before = find(&dir.path());
+    let (out, err) = run(vec!["--dry-run"], vec![Path::new("..")], "", Some(&dir.path().join("a"))).expect("rm-rfp exec failed");
+    let after = find(&dir.path());
+    assert_eq!(before, after);
+    println!("err={err}\nout={out}");
+    assert_ne!(err.as_str(), "");
+    assert_eq!(out.as_str(), "");
+}
+
+#[test]
+fn test_root_preserve() {
+    test_dry_run(); // This test is quite dangerous if --dry-run doesn't work. So it's got to be a prerequisite!
+    test_interactive_ynq(); // As a backup we also set --interactive and send a "q".
+    // FIXME: is there some way to chroot or something so this isn't such a dire test to fail?
+    let (out, err) = run(vec!["--dry-run", "-i"], vec![Path::new("/")], "q", None).expect("rm-rfp exec failed");
+    println!("out:\n{out}\nerr:\n{err}");
+    assert_ne!(err.as_str(), "");
+    assert_eq!(out.as_str(), "");
+    assert!(err.contains("--no-preserve-root"));
+    assert!(err.to_lowercase().contains("error"));
+    assert!(err.to_lowercase().contains("refusing"));
+}
+
+#[test]
+fn test_no_root_preserve() {
+    test_dry_run(); // This test is quite dangerous if --dry-run doesn't work. So it's got to be a prerequisite!
+    test_interactive_ynq(); // As a backup we also set --interactive and send a "q".
+    // FIXME: is there some way to chroot or something so this isn't such a dire test to fail?
+    let (out, err) = run(vec!["--dry-run", "-i", "--no-preserve-root"], vec![Path::new("/")], "q", None).expect("rm-rfp exec failed");
+    println!("out:\n{out}\nerr:\n{err}");
+    assert_eq!(err.as_str(), "");
+    assert_ne!(out.as_str(), ""); // should ask about / and get "q"
+}
+
+fn print_utf8(what: &str, bytes: &[u8]) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => println!("{what}:\n{s}"),
+        Err(_) => println!("{what}: Bad utf-8!. Lossy:\n{}", std::string::String::from_utf8_lossy(bytes)),
+    }
+ }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_root_preserve_all_macos() -> Result<()> {
+    // On macOS we can mount a disk image as a user and then use that to
+    // test our equivalent of coreutil's `--preserve-root=all`. TODO: How to
+    // test this on linux?
+
+    let dir = make_test_tree(3).expect("make_test_tree");
+    let mountpoint = dir.path().join("a");
+    let out = Command::new("hdiutil")
+        .args(vec!["create", "-size", "1m", "-fs", "HFS+", "-volname", "rm-rfp test"])
+        .arg(dir.path().join("test.dmg"))
+        .output()?;//.expect("hdiutil create failed!");
+    print_utf8("hdiutil create out", &out.stdout);
+    print_utf8("hdiutil create err", &out.stderr);
+    out.status.success().then_some(()).ok_or(anyhow!("hdiutil create failed!"))?;
+
+    let out = Command::new("hdiutil")
+        .arg("attach").arg(dir.path().join("test.dmg"))
+        .arg("-mountpoint").arg(&mountpoint)
+        .output().expect("hdiutil attach failed!");
+    assert!(out.status.success());
+
+    print_utf8("hdiutil attach out", &out.stdout);
+    print_utf8("hdiutil attach err", &out.stderr);
+
+    let preserve_root = run(vec!["--dry-run"], vec![&mountpoint], "", None);
+    let no_preserve_root = run(vec!["--dry-run", "--no-preserve-root"], vec![&mountpoint], "", None);
+
+    // before any panics, unmount the disk image!
+    let out = Command::new("hdiutil")
+        .arg("detach").arg(mountpoint)
+        .output().expect("hdiutil detach failed!");
+    print_utf8("hdiutil detach out", &out.stdout);
+    print_utf8("hdiutil detach err", &out.stderr);
+    assert!(out.status.success());
+
+    let (out, err) = preserve_root.expect("rm-rfp exec failed");
+    println!("rm-rfp out:\n{out}");
+    println!("rm-rfp err:\n{err}");
+
+    assert_ne!(err.as_str(), "");
+    assert_eq!(out.as_str(), "");
+    assert!(err.contains("--no-preserve-root"));
+    assert!(err.to_lowercase().contains("error"));
+    assert!(err.to_lowercase().contains("refusing"));
+
+    let (out, err) = no_preserve_root.expect("rm-rfp exec failed");
+    println!("rm-rfp --no-preserve-root out:\n{out}");
+    println!("rm-rfp --no-preserve-root err:\n{err}");
+
+    assert_eq!(err.as_str(), "");
+    assert_eq!(out.as_str(), "");
+    Ok(())
 }

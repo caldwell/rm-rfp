@@ -29,6 +29,7 @@ Options:
   -h, --help          Show this screen.
   -n, --dry-run       Don't delete anything, but go through the motions as if it were.
   -i, --interactive   Prompt before deleting each file.
+  --no-preserve-root  Don't fail if '/' is given as an argument.
 "#)
 }
 
@@ -36,6 +37,7 @@ Options:
 struct Args {
     flag_dry_run:     bool,
     flag_interactive: bool,
+    flag_no_preserve_root: bool,
     arg_path:         Vec<PathBuf>,
 }
 
@@ -43,6 +45,12 @@ fn main() -> Result<()> {
     let args: Args = Docopt::new(usage())
         .and_then(|d| d.deserialize())
         .unwrap_or_else(|e| e.exit());
+
+    // Do this up front so the user doesn't get halfway through a delete run before seeing failures.
+    let validator = Validator::new(!args.flag_no_preserve_root, !args.flag_no_preserve_root)?;
+    for path in args.arg_path.iter() {
+        validator.validate(path)?;
+    }
 
     let (to_delete_tx, to_delete_rx) = sync_channel(1_000_000);
 
@@ -384,5 +392,92 @@ fn is_same_dir(p1: &Path, p2: &Path) -> bool {
             false
         },
         (None, _) => false,
+    }
+}
+
+struct Validator {
+    root_inode: Option<u64>,
+    root_device: Option<u64>,
+    preserve_all_roots: bool,
+}
+
+impl Validator {
+    fn new(preserve_root: bool, preserve_all_roots: bool) -> Result<Validator> {
+        #[cfg(unix)]
+        if preserve_root {
+            use std::os::unix::fs::MetadataExt;
+            let m = Path::new("/").symlink_metadata()?;
+            return Ok(Validator {
+                root_inode: Some(m.ino()),
+                root_device: Some(m.dev()),
+                preserve_all_roots,
+            })
+        }
+
+        return Ok(Validator {
+            root_inode: None,
+            root_device: None,
+            preserve_all_roots,
+        })
+    }
+
+    // These checks are how coreutils checks for `rm -rf` sanity.
+    // --no-preserve-root appears to be POSIX, as does the ".", ".." check.
+    // The preserve_all_roots check seems to be a GNU addition but seems reasonable.
+    fn validate(&self, path: &Path) -> Result<()> {
+
+        let m = path.symlink_metadata()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        match (self.root_inode, self.root_device, m.ino(), m.dev()) {
+            (Some(root_inode), Some(root_device), inode, dev) if root_inode == inode && root_device == dev => {
+                if path == Path::new("/") { // More or less copy coreutils here.
+                    Err(anyhow!("{path:?}: Refusing to delete \"/\". You can override with `--no-preserve-root`"))?
+                } else {
+                    Err(anyhow!("{path:?}: Refusing to delete (same as \"/\"). You can override with `--no-preserve-root`"))?
+                }
+            },
+            _ => {},
+        }
+
+        #[cfg(unix)]
+        if self.preserve_all_roots {
+            if let Some(parent) = // This can only be None if they passed in "/", which should be caught above.
+                if m.is_dir() {
+                    Some(path.join(".."))
+                } else {
+                    path.parent().map(|p| p.join(".."))
+                }
+            {
+                let parent = parent.symlink_metadata().map_err(|e| anyhow!("{path:?}: Couldn't stat parent {parent:?}: {e}"))?;
+                if parent.dev() != m.dev() {
+                    Err(anyhow!("{path:?}: Refusing to delete because it is the root of a mounted filesystem. \
+                                 You can override with `--no-preserve-root`"))?
+                }
+            }
+        }
+
+        if Self::ends_with_dot(path) || path.ends_with("..") {
+            Err(anyhow!("{path:?}: Refusing to delete \"\" or \"\" directory."))?
+        }
+
+        Ok(())
+    }
+
+    // This is surprisingly annoying to do with std::path::Path because Rust
+    // helpfully ignores single '.'  components in the lowest level parsing
+    // routine. So we have to parse it ourselves here.
+    fn ends_with_dot(path: &Path) -> bool {
+        fn is_separator_byte(b: &u8) -> bool {
+            b.is_ascii() && std::path::is_separator(*b as char)
+        }
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let mut comp_iter = bytes.rsplit(is_separator_byte);
+        loop {
+            let Some(comp) = comp_iter.next() else { return false }; // this should only happen if the whole path is separators.
+            if comp.len() == 0 { continue } // means separator bumped against start, end, or another separator. Ignore it.
+            return comp == b"."; // The first real component we find is the last one so check it against "."
+        }
     }
 }
